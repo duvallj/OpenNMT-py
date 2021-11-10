@@ -2,6 +2,7 @@
 import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from onmt.utils.misc import generate_relative_positions_matrix,\
                             relative_matmul
@@ -228,3 +229,160 @@ class MultiHeadedAttention(nn.Module):
 
     def update_dropout(self, dropout):
         self.dropout.p = dropout
+
+class RelMultiHeadedAttention(nn.Module):
+    """Relative Multi-Headed Attention module from Transformer-XL
+    :cite:https://arxiv.org/pdf/1901.02860v3.pdf
+
+    Similar to standard multi-headed attention, but uses relative encodings
+    when computing key vectors, and trainable parameters to replace queries
+    that used to be absolutely encoded.
+
+    This is different than the relative encodings enabled by setting
+    `max_relative_positions` in the standard MultiHeadedAttention module.
+
+    Heavily drawn from the [author's published code](https://github.com/kimiyoung/transformer-xl),
+    specifically their `RelPartialLearnableMultiHeadAttn` module that they
+    present in the paper.
+
+    Args:
+       head_count (int): number of parallel heads
+       head_dim (int): the dimension of each head
+       model_dim (int): the dimension of keys/values/queries. Ideally this is
+                        head_count * head_dim
+       dropatt (float): dropout parameter after computing attention,
+           NOTE: This is the same as `dropout` on MultiHeadedAttention
+       dropout (float): dropout parameter after final linear layer
+       pre_lnorm (bool): whether to do layer normalization on input/output
+    """
+    def __init__(self, head_count, model_dim, dropatt=0.0, dropout=0.1, pre_lnorm=False):
+        super(RelMultiHeadedAttention, self).__init__()
+
+        self.model_dim = model_dim
+        self.head_dim = head_dim
+        self.head_count = head_count
+
+        self.linear_qkv = nn.Linear(model_dim, 3 * head_count * head_dim,
+                                    bias=False)
+        self.softmax = nn.Softmax(dim=1)
+        self.dropatt = nn.Dropout(dropatt)
+        self.dropout = nn.Dropout(dropout)
+        self.linear_relative = nn.Linear(model_dim, head_count * head_dim,
+                                         bias=False)
+        self.linear_output = nn.Linear(head_count * head_dim, model_dim,
+                                       bias=False)
+
+        self.pre_lnorm = pre_lnorm
+        if pre_lnorm: self.layer_norm = nn.LayerNorm(model_dim)
+
+        self.scale = 1 / (self.dim_per_head ** 0.5)
+
+    def _rel_shift(self, x):
+        """
+        Args:
+            x (Tensor(height, width, ...))
+        Returns:
+            A version of x where the last row remains in place, the second to
+            last is left-shifted by one, the third to last is left-shifted by
+            two, and so on. The rationale is presented in Appendix B of
+            :cite:https://arxiv.org/pdf/1901.02860v3.pdf
+        """
+        zero_pad = torch.zeros((x.size(0), 1, *x.size()[2:]),
+                               device=x.device, dtype=x.dtype)
+        x_padded = torch.cat([zero_pad, x], dim=1)
+        x_padded = x_padded.view(x.size(1) + 1, x.size(0), *x.size()[2:])
+        x = x_padded[1:].view_as(x)
+
+        return x
+
+    def forward(self, w, r, r_w_bias, r_r_bias, attn_mask, mems=None):
+        """
+        Args:
+            w (Tensor(query_len, batch_size, model_dim)):
+                The output from the previous layer
+            r (Tensor(relative_len, batch_size, model_dim)):
+                Tensor representing the relative position encodings
+            r_w_bias (Tensor(head_count, head_dim)):
+                Learned bias for term (c), that is the query vectors against
+                keys given by the relative output of the previous layer
+            r_r_bias (Tensor(head_count, head_dim)):
+                Learned bias for term (d), that is the query vectors against
+                keys given by the relative position
+            attn_mask (Tensor(query_len, key_len) or
+                       Tensor(query_len, key_len, batch_size)):
+                How to mask the resulting attention so that non-desired
+                shifted parts of the relative matrix don't interfere with our
+                calculations.
+            mems (Tensor(memory_len, batch_size, model_dim)):
+                The previous context vectors to concatenate to our current one
+        Returns:
+            Tensor(query_len, batch_size, model_dim): The context vector for
+            the next layer
+        """
+        qlen, rlen, batch_size = w.size(0), r.size(0), w.size(1)
+
+        if mems is not None:
+            w = torch.cat([mems, w], 0)
+            if self.pre_lnorm: w = self.layer_norm(w)
+
+            w_heads = self.qkv_net(w)
+            w_head_q, w_head_k, w_head_v = torch.chunk(w_heads, 3, dim=-1)
+            w_head_q = w_head_q[-qlen:]
+        else:
+            if self.pre_lnorm: w = self.layer_norm(w)
+
+            w_heads = self.qkv_net(w)
+            w_head_q, w_head_k, w_head_v = torch.chunk(w_heads, 3, dim=-1)
+
+        r_head_k = self.linear_relative(r)
+
+        klen = w_head_k.size(0)
+
+        w_head_q = w_head_q.view(qlen, batch_size, self.head_count, self.head_dim)
+        w_head_k = w_head_q.view(klen, batch_size, self.head_count, self.head_dim)
+        w_head_v = w_head_q.view(klen, batch_size, self.head_count, self.head_dim)
+        r_head_k = r_head_k.view(rlen, self.head_count, self.head_dim)
+
+        rw_head_q = w_head_q + r_w_bias
+        # (qlen, klen, batch_size, head_count)
+        AC = torch.einsum('ibnd,jbnd->ijbn', (rw_head_q, w_head_k))
+
+        rr_head_q = w_head_q + r_r_bias
+        # (qlen, klen, batch_size, head_count)
+        BD = torch.einsum('ibnd,jnd->ijbn', (rr_head_q, r_head_k))
+        BD = self._rel_shift(BD)
+
+        # (qlen, klen, batch_size, head_count)
+        attn_scores = AC + BD
+        attn_scores.mul_(self.scale)
+
+        if attn_mask.dim() == 2:
+            attn_scores = attn_scores.float().masked_fill(
+                attn_mask[:,:,None,None], -float('inf')
+            ).type_as(attn_scores)
+        elif attn_mask.dim() == 3:
+            attn_scores = attn_scores.float().masked_fill(
+                attn_mask[:,:,:,None], -float('inf')
+            ).type_as(attn_scores)
+        else:
+            raise RuntimeError(f"Dimension error: attn_mask should have 2 or 3 dimensions, not {attn_mask.dim()}")
+
+        attn_probs = self.softmax(attn_scores)
+        attn_probs = self.dropatt(attn_probs)
+
+        # (qlen, batch_size, head_count, head_dim)
+        attn_vec = torch.einsum('ijbn,jbnd->ibnd', (attn_probs, w_head_v))
+        attn_vec = attn_vec.contiguous().view(
+            attn_vec.size(0),
+            attn_vec.size(1),
+            self.head_count * self.head_dim
+        )
+
+        attn_out = self.linear_output(attn_vec)
+        attn_out = self.dropout(attn_out)
+
+        # Make a residual connection
+        output = w + attn_out
+        if self.pre_lnorm: output = self.layer_norm(output)
+
+        return output
